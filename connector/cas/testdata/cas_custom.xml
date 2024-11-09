@@ -1,0 +1,13 @@
+<user>
+    <info>
+        <username>123456</username>
+        <email>user</email>
+        <uid>uuid</uid>
+        <fullemail>user@company</fullemail>
+        <name>NAME</name>
+        <organization>RD1</organization>
+        <organization>RD2</organization>
+        <companyCode>CORP</companyCode>
+        <telephone>00000000000</telephone>
+    </info>
+</user>
