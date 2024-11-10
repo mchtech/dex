@@ -1,6 +1,4 @@
-// Package authproxy implements a connector which relies on external
-// authentication (e.g. mod_auth in Apache2) and returns an identity with the
-// HTTP header X-Remote-User as verified email.
+// Package cas provides authentication strategies using CAS.
 package cas
 
 import (
@@ -14,32 +12,35 @@ import (
 	"strings"
 
 	"github.com/dexidp/dex/connector"
+	"github.com/pkg/errors"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/transform"
 	"gopkg.in/cas.v2"
 )
 
-// Config holds the configuration parameters for a connector which returns an
-// identity with the HTTP header X-Remote-User as verified email,
-// X-Remote-Group and configured staticGroups as user's group.
-// Headers retrieved to fetch user's email and group can be configured
-// with userHeader and groupHeader.
+// Config holds configuration options for CAS logins.
 type Config struct {
 	Portal  string            `json:"portal"`
 	Spec    string            `json:"spec"`
 	Mapping map[string]string `json:"mapping"`
 }
 
-// Open returns an authentication strategy which requires no user interaction.
+// Open returns a strategy for logging in through CAS.
 func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
+
+	casURL, err := url.Parse(c.Portal)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse casURL %q: %v", c.Portal, err)
+	}
 
 	if c.Spec == "custom" && len(c.Mapping) == 0 {
 		return nil, fmt.Errorf("cas attribute mapping is empty")
 	}
 
-	return &callback{
-		portal:     c.Portal,
+	return &casConnector{
+		client:     http.DefaultClient,
+		portal:     casURL,
 		spec:       c.Spec,
 		mapping:    c.Mapping,
 		logger:     logger.With(slog.Group("connector", "type", "cas", "id", id)),
@@ -47,18 +48,21 @@ func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, erro
 	}, nil
 }
 
-// Callback is a connector which returns an identity with the HTTP header
-// X-Remote-User as verified email.
-type callback struct {
-	portal     string
+var (
+	_ connector.CallbackConnector = (*casConnector)(nil)
+)
+
+type casConnector struct {
+	client     *http.Client
 	spec       string
+	portal     *url.URL
 	mapping    map[string]string
 	logger     *slog.Logger
 	pathSuffix string
 }
 
 // LoginURL returns the URL to redirect the user to login with.
-func (m *callback) LoginURL(s connector.Scopes, callbackURL, state string) (string, error) {
+func (m *casConnector) LoginURL(s connector.Scopes, callbackURL, state string) (string, error) {
 	u, err := url.Parse(callbackURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse callbackURL %q: %v", callbackURL, err)
@@ -70,29 +74,21 @@ func (m *callback) LoginURL(s connector.Scopes, callbackURL, state string) (stri
 	v.Set("state", state)
 	u.RawQuery = v.Encode()
 
-	casURL, err := url.Parse(m.portal)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse casURL %q: %v", m.portal, err)
-	}
-	casURL.Path += "/login"
+	loginURL := *m.portal
+	loginURL.Path += "/login"
 	// service = $callbackURL + $m.pathSuffix ? state=$state & context=$callbackURL + $m.pathSuffix
-	q := casURL.Query()
+	q := loginURL.Query()
 	q.Set("service", u.String()) // service = ...?state=...&context=...
-	casURL.RawQuery = q.Encode()
-
-	return casURL.String(), nil
+	loginURL.RawQuery = q.Encode()
+	return loginURL.String(), nil
 }
 
 // HandleCallback parses the request and returns the user's identity
-func (m *callback) HandleCallback(s connector.Scopes, r *http.Request) (connector.Identity, error) {
+func (m *casConnector) HandleCallback(s connector.Scopes, r *http.Request) (connector.Identity, error) {
 
 	state := r.URL.Query().Get("state")
 	ticket := r.URL.Query().Get("ticket")
 
-	casURL, err := url.Parse(m.portal)
-	if err != nil {
-		return connector.Identity{}, fmt.Errorf("failed to parse casURL %q: %v", m.portal, err)
-	}
 	// service=context = $callbackURL + $m.pathSuffix
 	serviceURL, err := url.Parse(r.URL.Query().Get("context"))
 	if err != nil {
@@ -104,7 +100,7 @@ func (m *callback) HandleCallback(s connector.Scopes, r *http.Request) (connecto
 	q.Set("state", state)
 	serviceURL.RawQuery = q.Encode()
 
-	user, err := m.getCasUserByTicket(ticket, casURL, serviceURL)
+	user, err := m.getCasUserByTicket(ticket, serviceURL)
 	if err != nil {
 		return connector.Identity{}, err
 	}
@@ -112,9 +108,9 @@ func (m *callback) HandleCallback(s connector.Scopes, r *http.Request) (connecto
 	return user, nil
 }
 
-func (m *callback) getCasUserByTicket(ticket string, casUrl, serviceUrl *url.URL) (id connector.Identity, err error) {
+func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (id connector.Identity, err error) {
 
-	validator := cas.NewServiceTicketValidator(http.DefaultClient, casUrl)
+	validator := cas.NewServiceTicketValidator(m.client, m.portal)
 
 	switch m.spec {
 	case "", "standard":
@@ -124,8 +120,8 @@ func (m *callback) getCasUserByTicket(ticket string, casUrl, serviceUrl *url.URL
 		)
 
 		// validate ticket
-		if resp, err = validator.ValidateTicket(serviceUrl, ticket); err != nil {
-			err = fmt.Errorf("failed to validate ticket via %q with ticket %q: %v", serviceUrl, ticket, err)
+		if resp, err = validator.ValidateTicket(serviceURL, ticket); err != nil {
+			err = errors.Wrapf(err, "failed to validate ticket via %q with ticket %q", serviceURL, ticket)
 			return
 		}
 
@@ -137,15 +133,25 @@ func (m *callback) getCasUserByTicket(ticket string, casUrl, serviceUrl *url.URL
 		}
 		if username, ok := m.mapping["username"]; ok {
 			id.Username = resp.Attributes.Get(username)
+			if id.Username == "" && username == "userid" {
+				id.Username = resp.User
+			}
 		}
 		if preferredUsername, ok := m.mapping["preferred_username"]; ok {
 			id.PreferredUsername = resp.Attributes.Get(preferredUsername)
+			if id.PreferredUsername == "" && preferredUsername == "userid" {
+				id.PreferredUsername = resp.User
+			}
 		}
 		if email, ok := m.mapping["email"]; ok {
 			id.Email = resp.Attributes.Get(email)
 			if id.Email != "" {
 				id.EmailVerified = true
 			}
+		}
+		// override memberOf
+		if groups, ok := m.mapping["groups"]; ok {
+			id.Groups = resp.Attributes[groups]
 		}
 		return
 
@@ -158,8 +164,8 @@ func (m *callback) getCasUserByTicket(ticket string, casUrl, serviceUrl *url.URL
 			u           *url.URL
 		)
 
-		if validateURL, err = validator.ValidateUrl(serviceUrl, ticket); err != nil {
-			err = fmt.Errorf("failed to construct validate url with service url %q and ticket %q: %v", serviceUrl, ticket, err)
+		if validateURL, err = validator.ValidateUrl(serviceURL, ticket); err != nil {
+			err = fmt.Errorf("failed to construct validate url with service url %q and ticket %q: %v", serviceURL, ticket, err)
 			return
 		}
 
