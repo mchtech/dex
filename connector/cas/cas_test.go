@@ -57,7 +57,6 @@ mapping:
 }
 
 func TestCAS(t *testing.T) {
-
 	callback := "https://dex.example.org/dex/callback"
 	casURL, _ := url.Parse("https://example.org/cas")
 	scope := connector.Scopes{Groups: true}
@@ -106,7 +105,6 @@ func TestCAS(t *testing.T) {
 
 	seed := rand.NewSource(time.Now().UnixNano())
 	for _, tc := range cases {
-
 		ticket := fmt.Sprintf("ST-%d", seed.Int63())
 		state := fmt.Sprintf("%d", seed.Int63())
 

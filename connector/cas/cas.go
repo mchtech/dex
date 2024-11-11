@@ -28,7 +28,6 @@ type Config struct {
 
 // Open returns a strategy for logging in through CAS.
 func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, error) {
-
 	casURL, err := url.Parse(c.Portal)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse casURL %q: %v", c.Portal, err)
@@ -48,9 +47,7 @@ func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, erro
 	}, nil
 }
 
-var (
-	_ connector.CallbackConnector = (*casConnector)(nil)
-)
+var _ connector.CallbackConnector = (*casConnector)(nil)
 
 type casConnector struct {
 	client     *http.Client
@@ -85,14 +82,13 @@ func (m *casConnector) LoginURL(s connector.Scopes, callbackURL, state string) (
 
 // HandleCallback parses the request and returns the user's identity
 func (m *casConnector) HandleCallback(s connector.Scopes, r *http.Request) (connector.Identity, error) {
-
 	state := r.URL.Query().Get("state")
 	ticket := r.URL.Query().Get("ticket")
 
 	// service=context = $callbackURL + $m.pathSuffix
 	serviceURL, err := url.Parse(r.URL.Query().Get("context"))
 	if err != nil {
-		return connector.Identity{}, fmt.Errorf("failed to parse serviceURL %q: %v", r.URL.Query().Get("ext"), err)
+		return connector.Identity{}, fmt.Errorf("failed to parse serviceURL %q: %v", r.URL.Query().Get("context"), err)
 	}
 	// service = $callbackURL + $m.pathSuffix ? state=$state & context=$callbackURL + $m.pathSuffix
 	q := serviceURL.Query()
@@ -108,28 +104,25 @@ func (m *casConnector) HandleCallback(s connector.Scopes, r *http.Request) (conn
 	return user, nil
 }
 
-func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (id connector.Identity, err error) {
-
+func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (connector.Identity, error) {
 	validator := cas.NewServiceTicketValidator(m.client, m.portal)
-
+	id := connector.Identity{}
 	switch m.spec {
 	case "", "standard":
 
-		var (
-			resp *cas.AuthenticationResponse
-		)
+		var resp *cas.AuthenticationResponse
 
 		// validate ticket
-		if resp, err = validator.ValidateTicket(serviceURL, ticket); err != nil {
-			err = errors.Wrapf(err, "failed to validate ticket via %q with ticket %q", serviceURL, ticket)
-			return
+		resp, err := validator.ValidateTicket(serviceURL, ticket)
+		if err != nil {
+			return id, errors.Wrapf(err, "failed to validate ticket via %q with ticket %q", serviceURL, ticket)
 		}
 
 		// fill identity
 		id.UserID = resp.User
 		id.Groups = resp.MemberOf
 		if len(m.mapping) == 0 {
-			return
+			return id, nil
 		}
 		if username, ok := m.mapping["username"]; ok {
 			id.Username = resp.Attributes.Get(username)
@@ -153,25 +146,18 @@ func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (i
 		if groups, ok := m.mapping["groups"]; ok {
 			id.Groups = resp.Attributes[groups]
 		}
-		return
+		return id, nil
 
 	case "custom":
 
-		var (
-			resp        *http.Response
-			body        []byte
-			validateURL string
-			u           *url.URL
-		)
-
-		if validateURL, err = validator.ValidateUrl(serviceURL, ticket); err != nil {
-			err = fmt.Errorf("failed to construct validate url with service url %q and ticket %q: %v", serviceURL, ticket, err)
-			return
+		validateURL, err := validator.ValidateUrl(serviceURL, ticket)
+		if err != nil {
+			return id, fmt.Errorf("failed to construct validate url with service url %q and ticket %q: %v", serviceURL, ticket, err)
 		}
 
-		if u, err = url.Parse(validateURL); err != nil {
-			err = fmt.Errorf("failed to parse validate url %q: %v", validateURL, err)
-			return
+		u, err := url.Parse(validateURL)
+		if err != nil {
+			return id, fmt.Errorf("failed to parse validate url %q: %v", validateURL, err)
 		}
 
 		// set charset
@@ -181,16 +167,15 @@ func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (i
 		validateURL = u.String()
 
 		// validate ticket
-		if resp, err = http.DefaultClient.Get(validateURL); err != nil {
-			err = fmt.Errorf("failed to validate ticket via %q: %v", validateURL, err)
-			return
+		resp, err := m.client.Get(validateURL)
+		if err != nil {
+			return id, fmt.Errorf("failed to validate ticket via %q: %v", validateURL, err)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ = io.ReadAll(resp.Body)
-			err = fmt.Errorf("failed to validate ticket: unexpected status code %d: %s", resp.StatusCode, string(body))
-			return
+			body, _ := io.ReadAll(resp.Body)
+			return id, fmt.Errorf("failed to validate ticket: unexpected status code %d: %s", resp.StatusCode, string(body))
 		}
 
 		// construct cas attributes struct
@@ -224,9 +209,8 @@ func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (i
 			m.logger.Warn("unsupported charset", "name", cs)
 			return transform.NewReader(input, encoding.Nop.NewDecoder()), nil
 		}
-		if err = decoder.Decode(instance.Interface()); err != nil {
-			err = fmt.Errorf("failed to decode validate response: %v", err)
-			return
+		if err := decoder.Decode(instance.Interface()); err != nil {
+			return id, fmt.Errorf("failed to decode validate response: %v", err)
 		}
 
 		// fill id
@@ -254,13 +238,11 @@ func (m *casConnector) getCasUserByTicket(ticket string, serviceURL *url.URL) (i
 
 		// validate
 		if id.UserID == "" {
-			err = fmt.Errorf("cas return empty userid")
+			return id, fmt.Errorf("cas return empty userid")
 		}
-		return
+		return id, nil
 
 	default:
-		err = fmt.Errorf("unsupported cas spec: %s", m.spec)
-		return
-
+		return id, fmt.Errorf("unsupported cas spec: %s", m.spec)
 	}
 }
